@@ -30,7 +30,17 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <DataFrame/DataFrameMLVisitors.h>         // Machine-learning algorithms
 #include <DataFrame/DataFrameStatsVisitors.h>      // Statistical algorithms
 #include <DataFrame/Utils/DateTime.h>              // Cool and handy date-time object
+#include <DataFrame/Utils/Concepts.h>              // forward_iterator, etc
 
+#include <DataFrame/DataFrameTypes.h>
+#include <DataFrame/Internals/DataFrame_standalone.tcc>
+
+#include <mpi.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <iterator>
+#include <type_traits>
 #include <iostream>
 
 // -----------------------------------------------------------------------------
@@ -61,6 +71,294 @@ struct  MyData  {
     MyData() = default;
 };
 
+
+// Some mapping to MPI types
+template<typename T>
+constexpr MPI_Datatype map_datatype() {
+  if constexpr (std::is_same_v<double, T>) {
+    return MPI_DOUBLE;
+  } else if constexpr (std::is_same_v<int, T>) {
+    return MPI_INT;
+  } else if constexpr (std::is_same_v<bool, T>) {
+    return MPI_CHAR;
+  } else if constexpr (std::is_same_v<unsigned long, T>) {
+    return MPI_UNSIGNED_LONG;
+  } else {
+    std::cout << "WARNING: NO MPI TYPE DEFINED :(" << std::endl;
+    return -1;   // Uh oh!
+  }
+}
+
+template<typename T>
+void sendElement(const T& in, const int dest) {
+  MPI_Send(&in, 1, map_datatype<T>(), dest, 0, MPI_COMM_WORLD);
+}
+
+template<typename T>
+T recvElement(const int source) {
+  T rec;
+  MPI_Recv(&rec, 1, map_datatype<T>(), source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  return rec;
+}
+
+template<typename... RowTypes>
+void sendDataFrameEntry(ULDataFrame& df, ULDataFrame::IndexType index, const int dest) {
+  auto row = df.get_row<RowTypes...>(index);
+
+  // Send index
+  sendElement<ULDataFrame::IndexType>(index, dest);
+
+  // Send each element
+  ([&]() {
+    for (auto it = row.template begin<RowTypes>(); it != row.template end<RowTypes>(); ++it) {
+      sendElement<RowTypes>(*it, dest);
+    }
+  }()
+  , ...);
+}
+
+template<typename... RowTypes>
+void recvDataFrameEntry(ULDataFrame& df, const int source) {
+  // Recieve index
+  const auto index = recvElement<ULDataFrame::IndexType>(source);
+  df.get_index().push_back(index);
+
+  // Recv each element
+  size_t col_idx = 0;
+  ([&]() {
+    auto& col = df.get_column<RowTypes>(++col_idx);
+    const auto value = recvElement<RowTypes>(source);
+    col.push_back(value);
+  }()
+  , ...);
+}
+
+
+void my_testing() {
+  std::cout << "------------- TESTING -------------" << std::endl;
+  // Example 1
+  ULDataFrame df;
+  {
+    std::vector<unsigned long> index = { 0, 1, 2, 3 };
+    std::vector<std::string> statID = { "3321", "3321", "3321", "5513" };
+    std::vector<int> obsValue = { 23, 21, 21, 24 };
+    std::vector<bool> flag = { true, true, true, false };
+    df.load_index(std::move(index));
+    df.load_column("StatID", std::move(statID));
+    df.load_column("ObsValue", std::move(obsValue));
+    df.load_column("flag", std::move(flag));
+  }
+
+  std::cout << "DF: ";
+  df.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+
+  /* Output:
+DF: INDEX:4:<ulong>,StatID:4:<string>,ObsValue:4:<int>,flag:4:<bool>
+0,3321,23,1
+1,3321,21,1
+2,3321,21,1
+3,5513,24,0
+  */
+
+  // Example 2 & 3
+  // Get values of single column. Can get reference:
+  // auto& obsValueColRef = df.get_column<int>("ObsValue");
+  // OR copy to vector
+  std::vector<int> obsColumnCopy = df.get_column<int>("ObsValue");
+  std::cout << "ObsValue: {";
+  for (auto dataItem : obsColumnCopy) {
+    std::cout << dataItem << ", ";
+  }
+  std::cout << '}' << std::endl << std::endl;
+
+  /* Output:
+ObsValue: {23, 21, 21, 24, }
+  */
+
+  // Example 4: Adding columns
+  std::vector<double> example { 0.2, 35, 24, 12 };
+  df.load_column("example", std::move(example));
+  // -- Check this
+  df.write<std::ostream, unsigned long, std::string, int, bool, double>(std::cout, io_format::csv2);
+  /* Output:
+INDEX:4:<ulong>,StatID:4:<string>,ObsValue:4:<int>,flag:4:<bool>,example:4:<double>
+0,3321,23,1,0.2
+1,3321,21,1,35
+2,3321,21,1,24
+3,5513,24,0,12
+  */
+
+  // Example 5: Remove columns
+  df.remove_column("example");
+  std::cout << "After removing column:" << std::endl;
+  df.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+  /* Output:
+After removing column:
+INDEX:4:<ulong>,StatID:4:<string>,ObsValue:4:<int>,flag:4:<bool>
+0,3321,23,1
+1,3321,21,1
+2,3321,21,1
+3,5513,24,0
+  */
+
+  // Example 6: Add row / merge data frames.
+  // Adding a row:
+  unsigned long index_val = 4;
+  df.append_row(&index_val,
+                std::make_pair("StatID", std::string("3578")),
+                std::make_pair("ObsValue", 20),
+                std::make_pair("flag", true));
+  std::cout << "After adding a new row:" << std::endl;
+  df.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+
+  /* Output:
+After adding a new row:
+INDEX:5:<ulong>,StatID:5:<string>,ObsValue:5:<int>,flag:5:<bool>
+0,3321,23,1
+1,3321,21,1
+2,3321,21,1
+3,5513,24,0
+4,3578,20,1
+  */
+
+  // Merging data frames
+  ULDataFrame df2;
+  {
+    std::vector<unsigned long> index = { 5, 6 };
+    std::vector<std::string> statID = { "3833", "3122" };
+    std::vector<int> obsValue = { 23, 21 };
+    std::vector<bool> flag = { true, false };
+    df2.load_index(std::move(index));
+    df2.load_column("StatID", std::move(statID));
+    df2.load_column("ObsValue", std::move(obsValue));
+    df2.load_column("flag", std::move(flag));
+  }
+  std::cout << "df2: " << std::endl;
+  df2.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+
+  df.self_concat<decltype(df2), unsigned long, std::string, int, bool>(df2, true);
+  std::cout << "Concatenated dataframes:" << std::endl;
+  df.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+
+  /* Output:
+df2: 
+INDEX:2:<ulong>,StatID:2:<string>,ObsValue:2:<int>,flag:2:<bool>
+5,3833,23,1
+6,3122,21,0
+
+Concatenated dataframes:
+INDEX:7:<ulong>,StatID:7:<string>,ObsValue:7:<int>,flag:7:<bool>
+0,3321,23,1
+1,3321,21,1
+2,3321,21,1
+3,5513,24,0
+4,3578,20,1
+5,3833,23,1
+6,3122,21,0
+  */
+
+  // Example 7: Slicing
+  auto notStatID3321 = [](const unsigned long &, const std::string &id) -> bool { return id.compare("3321") != 0; };
+  auto dfNoStatID3321 =
+    df.get_data_by_sel<std::string, decltype(notStatID3321), std::string, int, bool>("StatID", notStatID3321);
+
+  std::cout << "After applying function `notStatID3321`:" << std::endl;
+  dfNoStatID3321.write<std::ostream, unsigned long, std::string, int, bool>(std::cout, io_format::csv2);
+  /* Output:
+After applying function `notStatID3321`:
+INDEX:4:<ulong>,StatID:4:<string>,ObsValue:4:<int>,flag:4:<bool>
+3,5513,24,0
+4,3578,20,1
+5,3833,23,1
+6,3122,21,0
+  */
+
+  // -- Evaluating a string expression would be nice but not possible.
+  //    Perhaps we can implement an expression interpreter?
+
+  // Example 8: Grouping & performing operations on groups
+  auto future = df.groupby1_async<std::string>("StatID",
+                                               LastVisitor<ULDataFrame::IndexType, ULDataFrame::IndexType>(),
+                                               std::make_tuple("ObsValue", "sumObs", SumVisitor<int>()),
+                                               std::make_tuple("ObsValue", "meanObs", MeanVisitor<int>()));
+
+  auto result = future.get();
+  std::cout << "Result: " << std::endl;
+  result.write<std::ostream, unsigned long, std::string, int, bool, double>(std::cout, io_format::csv2);
+
+
+  /* Output:
+Result: 
+INDEX:5:<ulong>,StatID:5:<string>,sumObs:5:<int>,meanObs:5:<int>
+6,3122,21,21
+2,3321,65,21
+4,3578,20,20
+5,3833,23,23
+3,5513,24,24
+  */
+
+  std::cout << "----------------- 13/02/2024 ------------------" << std::endl;
+
+  // MPI: Each rank already has it's own obs?
+  // =========
+  MPI_Init(NULL, NULL);
+
+    int world_size;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    std::cout << "On rank: " << rank << "/" << world_size << std::endl;
+
+    // Generate some random numbers for obs.
+    srand (time(NULL) * rank);   // Seed based on rank - each PE has different obs
+
+    ULDataFrame dfRand;
+    {
+      constexpr size_t NUM = 5;
+      std::vector<double> obsValue(NUM);
+      std::generate(obsValue.begin(), obsValue.end(), std::rand);
+      std::vector<bool> flag(NUM, true);
+      flag[52] = false;
+
+      std::vector<unsigned long> index(flag.size());
+      std::iota(index.begin(), index.end(), rank * index.size());    // Index / ID as function of rank
+      df.load_index(std::move(index));
+      df.load_column("ObsValue", std::move(obsValue));
+      df.load_column("flag", std::move(flag));
+    }
+
+    if (rank == 0) {
+      std::cout << "[0] DF: ";
+      df.write<std::ostream, double, bool>(std::cout, io_format::csv2);
+      std::cout << std::endl;
+    } else if (rank == 1) {
+      sleep(1);
+      
+      std::cout << "[1] DF: ";
+      df.write<std::ostream, double, bool>(std::cout, io_format::csv2);
+      std::cout << std::endl;
+    }
+
+    // Get an observation on another PE based on index.
+    
+    if (rank == 0) {
+      sendDataFrameEntry<double, bool>(df, 0, 1);     
+    } else if (rank == 1) {
+      recvDataFrameEntry<double, bool>(df, 0);
+      std::cout << "[1] DF after recieving a new row: ";
+      df.write<std::ostream, double, bool>(std::cout, io_format::csv2);
+      std::cout << std::endl;
+    }
+
+
+  MPI_Finalize();
+  // =========
+
+  std::cout << "-----------------------------------" << std::endl;
+}
+
 // -----------------------------------------------------------------------------
 
 // The main purpose of this file is to introduce the basic operations of DataFrame.
@@ -69,6 +367,9 @@ struct  MyData  {
 //
 int main(int, char *[])  {
 
+    my_testing();
+
+    /*
     std::vector<unsigned long>  idx_col1 = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     std::vector<MyData>         mydata_col (10);
     std::vector<int>            int_col1 = { 1, 2, -3, -4, 5, 6, 7, 8, 9, -10 };
@@ -291,7 +592,6 @@ int main(int, char *[])  {
     for (const auto &mean : cluster_means)
         std::cout << mean << ", ";
     std::cout << std::endl;
-    /*
     // This produces a very large output.
     //
     std::cout << "\nClusters are: ";
@@ -300,7 +600,6 @@ int main(int, char *[])  {
             std::cout << mean2 << ", ";
         std::cout << '\n' << std::endl;
     }
-    */
 
     // We want to find a few quantiles of IBM returns
     //
@@ -366,6 +665,7 @@ int main(int, char *[])  {
         std::cout << facorr2.get_result()[i] << ", ";
     std::cout << std::endl;
 
+    */
     return (0);
 }
 
