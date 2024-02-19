@@ -43,6 +43,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <type_traits>
 #include <iostream>
 
+#include "MyTestFortran.h"
+
 // -----------------------------------------------------------------------------
 
 // DataFrame library is entirely under hmdf name-space
@@ -102,17 +104,22 @@ T recvElement(const int source) {
 }
 
 template<typename... RowTypes>
-void sendDataFrameEntry(ULDataFrame& df, ULDataFrame::IndexType index, const int dest) {
-  auto row = df.get_row<RowTypes...>(index);
-
+void sendDataFrameEntry(const ULDataFrame& df, const ULDataFrame::IndexType index, const int dest) {
   // Send index
   sendElement<ULDataFrame::IndexType>(index, dest);
 
-  // Send each element
+  // Find what location in column this index is.
+  const auto& idx_array = df.get_index();
+  auto it = std::find(idx_array.begin(), idx_array.end(), index);
+  if (it == idx_array.end()) {
+    throw std::runtime_error("No index in array! => " + std::to_string(index));
+  }
+  const size_t pos = it - idx_array.begin();
+
+  size_t col_idx = 0;
   ([&]() {
-    for (auto it = row.template begin<RowTypes>(); it != row.template end<RowTypes>(); ++it) {
-      sendElement<RowTypes>(*it, dest);
-    }
+    const auto& col = df.get_column<RowTypes>(++col_idx);
+    sendElement<RowTypes>(col[pos], dest);
   }()
   , ...);
 }
@@ -344,7 +351,7 @@ INDEX:5:<ulong>,StatID:5:<string>,sumObs:5:<int>,meanObs:5:<int>
     // Get an observation on another PE based on index.
     
     if (rank == 0) {
-      sendDataFrameEntry<double, bool>(df, 0, 1);     
+      sendDataFrameEntry<double, bool>(df, 0, 1);
     } else if (rank == 1) {
       recvDataFrameEntry<double, bool>(df, 0);
       std::cout << "[1] DF after recieving a new row: ";
@@ -355,6 +362,14 @@ INDEX:5:<ulong>,StatID:5:<string>,sumObs:5:<int>,meanObs:5:<int>
 
   MPI_Finalize();
   // =========
+
+  // ==== Fortran ====
+  std::vector<double> exmpl {1, 2, 3, 4};
+
+  double sum;
+  mytest_mod_sum_obs_values_f90(exmpl.size(), exmpl[0], sum);
+  std::cout << "SUM: " << sum << std::endl;
+
 
   std::cout << "-----------------------------------" << std::endl;
 }

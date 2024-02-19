@@ -1,5 +1,8 @@
 find_package(MPI REQUIRED)
-add_executable(hello_world hello_world.cc)
+
+enable_language(Fortran)
+
+add_executable(hello_world hello_world.cc mytest_mod.f90 mytest_if.f90 MyTestFortran.h)
 
 target_link_libraries(hello_world PRIVATE DataFrame MPI::MPI_CXX)
 hmdf_target_data_files(hello_world
