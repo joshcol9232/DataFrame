@@ -86,7 +86,9 @@ constexpr MPI_Datatype map_datatype() {
   } else if constexpr (std::is_same_v<unsigned long, T>) {
     return MPI_UNSIGNED_LONG;
   } else {
-    static_assert(false, "No MPI data type for type requested.");
+    std::cout << "WARNING: NO MPI TYPE DEFINED :(" << std::endl;
+    throw std::runtime_error("MPI type not coded for...");
+    return -1;   // Uh oh!
   }
 }
 
@@ -95,15 +97,12 @@ void sendElement(const T& in, const int dest) {
   MPI_Send(&in, 1, map_datatype<T>(), dest, 0, MPI_COMM_WORLD);
 }
 
-void sendString(const std::string& in, const int dest) {
-  MPI_Send(in.c_str(), in.size(), MPI_CHAR, dest, 0, MPI_COMM_WORLD);
-}
-
 template<typename T>
 T recvElement(const int source) {
   T rec;
   MPI_Status s;
   MPI_Recv(&rec, 1, map_datatype<T>(), source, 0, MPI_COMM_WORLD, &s);
+  std::cout << "recvElement: MPI status => " << s.MPI_ERROR << std::endl;
   return rec;
 }
 
@@ -122,11 +121,13 @@ void sendDataFrameEntry(const ULDataFrame& df, const ULDataFrame::IndexType inde
 
   size_t col_idx = 0;
   ([&]() {
-    const auto& col = df.get_column<RowTypes>(col_idx);
+    std::cout << "[send] On col idx: " << col_idx << std::endl;
+    const auto& col = df.get_column<RowTypes>(++col_idx);
     assert(col.size() > 0);
 
+    std::cout << "[send] sending => " << col[pos] << std::endl;
     sendElement<RowTypes>(col[pos], dest);
-    col_idx++;
+    std::cout << "[send] sent => " << col[pos] << std::endl;
   }()
   , ...);
 }
@@ -140,11 +141,13 @@ void recvDataFrameEntry(ULDataFrame& df, const int source) {
   // Recv each element
   size_t col_idx = 0;
   ([&]() {
-    auto& col = df.get_column<RowTypes>(col_idx);
+    std::cout << "IN CLOSURE" << std::endl;
+    std::cout << "Index: " << col_idx << std::endl;
+    auto& col = df.get_column<RowTypes>(++col_idx);
+    std::cout << "Recv element..." << std::endl;
     const auto value = recvElement<RowTypes>(source);
+    std::cout << "VALUE: " << value << std::endl;
     col.push_back(value);
-
-    col_idx++;
   }()
   , ...);
 }
@@ -315,10 +318,6 @@ INDEX:5:<ulong>,StatID:5:<string>,sumObs:5:<int>,meanObs:5:<int>
 
   std::cout << "----------------- 13/02/2024 ------------------" << std::endl;
 
-  std::cout << "MPI TYPES: " << std::endl
-            << "double => " << map_datatype<double>() << std::endl
-            << "bool => " << map_datatype<bool>() << std::endl;
-
   // MPI: Each rank already has it's own obs?
   // =========
   MPI_Init(NULL, NULL);
@@ -354,20 +353,29 @@ INDEX:5:<ulong>,StatID:5:<string>,sumObs:5:<int>,meanObs:5:<int>
       dfRand.write<std::ostream, double, bool>(std::cout, io_format::csv2);
       std::cout << std::endl;
     } else if (rank == 1) {
+      std::cout << " RANK ! :)" << std::endl;
+      
       std::cout << "[1] DF: ";
       dfRand.write<std::ostream, double, bool>(std::cout, io_format::csv2);
       std::cout << std::endl;
     }
 
     // Get an observation on another PE based on index.
+    
     if (rank == 0) {
+      std::cout << "[0] SENDING ROW." << std::endl;
       sendDataFrameEntry<double, bool>(dfRand, 0, 1);
+      std::cout << "[0] ROW SENT." << std::endl;
     } else if (rank == 1) {
+      std::cout << "[1] RECV ROW..." << std::endl;
       recvDataFrameEntry<double, bool>(dfRand, 0);
+      std::cout << "[1] ROW RECIEVED." << std::endl;
       std::cout << "[1] DF after recieving a new row: ";
       dfRand.write<std::ostream, double, bool>(std::cout, io_format::csv2);
       std::cout << std::endl;
     }
+  
+    sleep(5);
 
   MPI_Finalize();
   // =========
